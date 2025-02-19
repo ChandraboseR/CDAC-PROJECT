@@ -1,0 +1,465 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <Wire.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <Base64.h>  
+
+// OLED Display Settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C  // I2C address for the OLED display
+
+// New OLED Pins
+#define OLED_SDA 13  // GPIO 13 (D7) for SDA
+#define OLED_SCL 17  // GPIO 17 (D9) for SCL
+
+// Ultrasonic Sensor Pins
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+// LED Pins
+#define LED1_PIN 4
+#define LED2_PIN 2
+#define LED3_PIN 15
+#define LED4_PIN 16
+
+// LDR Pin
+#define LDR_PIN 32
+
+// Motor Driver Pins
+#define ENA 22
+#define IN1 19
+#define IN2 21
+#define ENB 26
+#define IN3 23
+#define IN4 25
+
+// Flame Sensor and Buzzer Pins
+#define FLAME_SENSOR_DIGITAL_PIN 33
+#define BUZZER_PIN 14
+
+// DHT11 Sensor Pin
+#define DHTPIN 27
+#define DHTTYPE DHT11
+
+// RPM Sensor Pin
+#define SENSOR_PIN 34  // D0 connected to GPIO34
+
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Twilio credentials
+const char* accountSID = "**";  // Replace with your Twilio Account SID
+const char* authToken = "**";    // Replace with your Twilio Auth Token
+const char* fromNumber = "**";  // Replace with your Twilio phone number
+const char* toNumber = "**"; // Replace with the recipient phone number
+
+WiFiClient client ;  // Secure client for HTTPS
+WebServer server(80);
+bool autoMode = false;
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// RPM Sensor Variables
+volatile int pulseCount = 0;  
+unsigned long prevTime = 0;
+float rpm = 0;
+
+// OLED Display Object
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Function Declarations
+void IRAM_ATTR countPulses();
+void moveForward();
+void moveBackward();
+void moveLeft();
+void moveRight();
+void stopCar();
+float getDistance();
+void handleRoot();
+void handleControl();
+void updateOLED(float rpm, float temperature, float humidity, int flameDigital);
+void sendEmergencySMS();
+
+// Interrupt Service Routine (ISR) for RPM Sensor
+void IRAM_ATTR countPulses() {
+    pulseCount++;  
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    // Initialize I2C with new pins
+    Wire.begin(OLED_SDA, OLED_SCL);
+
+    // Initialize OLED Display
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {  // Corrected initialization
+        Serial.println(F("SSD1306 allocation failed"));
+        for (;;); // Halt forever if OLED fails
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Initializing...");
+    display.display();
+
+    // Ultrasonic Sensor
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+    // LED Pins
+    pinMode(LED1_PIN, OUTPUT);
+    pinMode(LED2_PIN, OUTPUT);
+    pinMode(LED3_PIN, OUTPUT);
+    pinMode(LED4_PIN, OUTPUT);
+
+    // LDR
+    pinMode(LDR_PIN, INPUT);
+
+    // Motor Pins
+    pinMode(ENA, OUTPUT);
+    pinMode(IN1, OUTPUT);
+    pinMode(IN2, OUTPUT);
+    pinMode(ENB, OUTPUT);
+    pinMode(IN3, OUTPUT);
+    pinMode(IN4, OUTPUT);
+
+    // Flame Sensor and Buzzer
+    pinMode(FLAME_SENSOR_DIGITAL_PIN, INPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+
+    // DHT11 Sensor
+    dht.begin();
+
+    // RPM Sensor
+    pinMode(SENSOR_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), countPulses, RISING);
+
+    stopCar(); // Ensure motors are stopped on startup
+
+    // Connect to WiFi
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi...");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    server.on("/", handleRoot);
+    server.on("/control", handleControl);
+    server.begin();
+}
+
+void moveForward() {
+    analogWrite(ENA, 255);
+    analogWrite(ENB, 255);
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+}
+
+void moveBackward() {
+    analogWrite(ENA, 255);
+    analogWrite(ENB, 255);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+}
+
+void moveLeft() {
+    analogWrite(ENA, 255);
+    analogWrite(ENB, 255);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+}
+
+void moveRight() {
+    analogWrite(ENA, 255);
+    analogWrite(ENB, 255);
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+}
+
+void stopCar() {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+}
+
+// Function to get stable ultrasonic distance
+float getDistance() {
+    float total = 0;
+    int validReadings = 0;
+
+    for (int i = 0; i < 3; i++) {  
+        digitalWrite(TRIG_PIN, LOW);
+        delayMicroseconds(2);
+        digitalWrite(TRIG_PIN, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(TRIG_PIN, LOW);
+
+        long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+        if (duration > 0) {
+            float distance = (duration * 0.0343) / 2;
+            total += distance;
+            validReadings++;
+        }
+        delay(50);
+    }
+
+    if (validReadings == 0) {
+        Serial.println("No valid ultrasonic reading!");
+        return -1;
+    }
+
+    float avgDistance = total / validReadings;
+    Serial.print("Ultrasonic Distance: ");
+    Serial.println(avgDistance);
+    return avgDistance;
+}
+
+void handleRoot() {
+    String html = R"rawliteral(
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Car Control</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; }
+                .btn { font-size: 20px; padding: 15px; width: 120px; margin: 5px; }
+                .stop { background-color: red; color: white; }
+            </style>
+        </head>
+        <body>
+            <h1>ESP32 Car Control</h1>
+            <button class="btn" onclick="sendCommand('F')">Forward</button><br>
+            <button class="btn" onclick="sendCommand('L')">Left</button>
+            <button class="btn stop" onclick="sendCommand('S')">Stop</button>
+            <button class="btn" onclick="sendCommand('R')">Right</button><br>
+            <button class="btn" onclick="sendCommand('B')">Backward</button><br>
+            <button class="btn" onclick="sendCommand('AUTO')">Auto Mode</button>
+            <button class="btn" onclick="sendCommand('MANUAL')">Manual Mode</button>
+
+            <script>
+                function sendCommand(cmd) {
+                    fetch("/control?cmd=" + cmd);
+                }
+            </script>
+        </body>
+        </html>
+    )rawliteral";
+
+    server.send(200, "text/html", html);
+}
+
+void handleControl() {
+    if (!server.hasArg("cmd")) {
+        server.send(400, "text/plain", "Missing command");
+        return;
+    }
+
+    String command = server.arg("cmd");
+    Serial.println("Command received: " + command);
+
+    if (command == "F") moveForward();
+    else if (command == "B") moveBackward();
+    else if (command == "L") moveLeft();
+    else if (command == "R") moveRight();
+    else if (command == "S") stopCar();
+    else if (command == "AUTO") autoMode = true;
+    else if (command == "MANUAL") autoMode = false;
+
+    server.send(200, "text/plain", "OK");
+}
+
+// Function to update OLED display with only speed, temperature, humidity, and flame status
+void updateOLED(float rpm, float temperature, float humidity, int flameDigital) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("ESP32 Car Status");
+    display.println("-----------------");
+    display.print("Speed: ");
+    display.print(rpm);
+    display.println(" RPM");
+    display.print("Temp: ");
+    display.print(temperature);
+    display.println(" C");
+    display.print("Humidity: ");
+    display.print(humidity);
+    display.println(" %");
+    display.print("Flame: ");
+    display.println(flameDigital ? "Fire" : " NO Fire!");
+    display.display();
+}
+
+void sendEmergencySMS() {
+    Serial.println("Sending SMS via Twilio...");
+
+String payload = "To=" + String(toNumber) +
+                 "&MessagingServiceSid=" + "MG98417dc5337cde752549b983d822d61d" +  // Use the Message Service SID
+                 "&Body=" + "Emergency! Fire detected by the sensor!";
+
+    Serial.println("Payload: " + payload);
+
+    // Attempt to connect to Twilio's API
+    if (client.connect("api.twilio.com", 443)) {
+        Serial.println("Connected to Twilio API");
+
+        // Create the authorization header with base64 encoding
+        String authHeader = "Basic " + base64::encode(String(accountSID) + ":" + String(authToken));
+
+
+        // Send the HTTP POST request to Twilio
+
+        client.println("POST /2010-04-01/Accounts/" + String(accountSID) + "/Messages.json HTTP/1.1");
+        client.println("Host: api.twilio.com");
+        client.println("Authorization: " + authHeader);
+        client.println("Content-Type: application/x-www-form-urlencoded");
+        client.println("Content-Length: " + String(payload.length()));
+        client.println();  // Blank line between headers and body
+        client.println(payload);  // The data (message to be sent)
+
+        Serial.println("Request sent to Twilio");
+
+        // Wait for response from Twilio
+        delay(2000);  // Wait for response from Twilio (may take a second)
+        
+        // Check response from Twilio
+        bool success = false;
+        while (client.available()) {
+            String line = client.readStringUntil('\n');
+            Serial.println(line);  // Print the response from Twilio for debugging
+            
+            // Check if Twilio API responds with a success status code
+            if (line.indexOf("HTTP/1.1 200 OK") >= 0) {
+                success = true;
+            }
+        }
+
+        if (success) {
+            Serial.println("SMS sent successfully!");
+        } else {
+            Serial.println("Failed to send SMS. Check the Twilio API response.");
+        }
+    } else {
+        Serial.println("Failed to connect to Twilio API. Check network connectivity or Twilio settings.");
+    }
+}
+
+void loop() {
+    server.handleClient(); // Handle web server requests
+
+    int ldrValue = analogRead(LDR_PIN); // Read LDR value
+    float distance = getDistance();
+
+    if (distance > 0) {
+        Serial.print("Distance: ");
+        Serial.print(distance);
+        Serial.println(" cm");
+
+        // Map distance (0-100 cm) to LED brightness (0-255)
+        int brightness = map(constrain(distance, 0, 100), 0, 100, 255, 50);
+        int oppositeBrightness = 255 - brightness;
+
+        // Adjust brightness based on LDR reading
+        if (ldrValue > 2048) { // Bright environment
+            brightness = 255 - brightness;
+        }
+
+        analogWrite(LED1_PIN, brightness);
+        analogWrite(LED2_PIN, brightness);
+        analogWrite(LED3_PIN, oppositeBrightness);
+        analogWrite(LED4_PIN, oppositeBrightness);
+    }
+
+    if (autoMode) {
+        if (distance > 30) {
+            Serial.println("Moving Forward...");
+            moveForward();
+        } else if (distance > 15) {
+            Serial.println("Obstacle detected, slowing down...");
+            moveForward();
+        } else if (distance > 0) {
+            Serial.println("Obstacle detected! Stopping...");
+            stopCar();
+        }
+    }
+
+    // Flame Sensor and Buzzer Logic
+    int flameDigital = digitalRead(FLAME_SENSOR_DIGITAL_PIN);
+    Serial.print("Fire Status: ");
+    Serial.println(flameDigital);  // 0 = Fire detected, 1 = No fire
+
+    if (flameDigital == 1) {  // Fire detected (assuming LOW means fire detected)
+        Serial.println("🔥 Fire detected! Activating buzzer and sending SMS...");
+        
+        digitalWrite(BUZZER_PIN, HIGH);  // Turn on buzzer
+
+        // Send an emergency SMS via Twilio
+        sendEmergencySMS();
+    } else {
+        Serial.println("✅ No fire detected. Buzzer OFF.");
+        digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    // DHT11 Sensor Logic
+    float temperature = dht.readTemperature();  // Read temperature (Celsius)
+    float humidity = dht.readHumidity();       // Read humidity (%)
+
+    if (isnan(temperature) || isnan(humidity)) {
+        Serial.println("❌ Failed to read from DHT sensor!");
+    } else {
+        Serial.print("🌡 Temperature: ");
+        Serial.print(temperature);
+        Serial.println("°C");
+
+        Serial.print("💧 Humidity: ");
+        Serial.print(humidity);
+        Serial.println("%");
+    }
+
+    // RPM Sensor Logic
+    unsigned long currentTime = millis();
+    
+    // Calculate RPM every second
+    if (currentTime - prevTime >= 1000) {
+        detachInterrupt(digitalPinToInterrupt(SENSOR_PIN));  // Temporarily disable interrupt
+        
+        rpm = (pulseCount * 60.0) / 20.0;  // Assuming 20 pulses per revolution
+        
+        Serial.print("Motor Speed: ");
+        Serial.print(rpm);
+        Serial.println(" RPM");
+        
+        pulseCount = 0;  
+        prevTime = currentTime;
+        
+        attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), countPulses, RISING); // Re-enable interrupt
+    }
+
+    // Update OLED Display with only speed, temperature, humidity, and flame status
+    updateOLED(rpm, temperature, humidity, flameDigital);
+
+    delay(100);
+}
